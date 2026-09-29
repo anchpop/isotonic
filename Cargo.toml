@@ -1,0 +1,24 @@
+[package]
+name = "isotonic"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Andre Popovitch"]
+repository = "https://github.com/anchpop/isotonic"
+description = "Weighted isotonic regression with interpolation and box smoothing"
+
+[[bench]]
+name = "isotonic_bench"
+harness = false
+
+[dependencies]
+eytzinger = { git = "https://github.com/anchpop/rust-eytzinger.git", rev = "ff5d86b8e5280c1f46c86fa135b0e0592cea1135", version = "1.1.2" }
+num-traits = "0.2.19"
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde"]
+
+[dev-dependencies]
+criterion = "0.8.2"
+rand = "0.10.3"
