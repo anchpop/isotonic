@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use isotonic::isotonic_regression::Direction;
-use isotonic::{IsotonicRegression, Point, SmoothRegression, UnitWeight};
+use isotonic::{IsotonicRegression, Point, RegressionEvaluator, SmoothRegression, UnitWeight};
 use rand::RngExt;
 use std::hint::black_box;
 
@@ -180,8 +180,28 @@ fn bench_smooth_new_direct(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_invert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("invert");
+    for size in [100, 1_000, 10_000, 100_000] {
+        let points: Vec<_> = (0..size)
+            .map(|i| Point::new(i as f64, i as f64 + ((i * 7 + 3) % 13) as f64 - 6.0))
+            .collect();
+        let fit = IsotonicRegression::new_ascending_sorted(&points);
+        let evaluator = RegressionEvaluator::new(fit.clone());
+        let smooth = SmoothRegression::from_regression(fit, 5.0);
+        group.bench_function(format!("evaluator/n={size}"), |b| {
+            b.iter(|| evaluator.invert(black_box(size as f64 * 0.51)))
+        });
+        group.bench_function(format!("smooth/n={size}"), |b| {
+            b.iter(|| smooth.invert(black_box(size as f64 * 0.51)))
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_invert,
     bench_new_ascending,
     bench_new_ascending_sorted,
     bench_sort_only,

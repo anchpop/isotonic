@@ -41,46 +41,16 @@ impl<X: Float, Y: Float, W> RegressionEvaluator<X, Y, W> {
 
     /// Plateaus invert to their midpoint; values outside the range clamp to an endpoint.
     pub fn invert(&self, at_y: Y) -> Option<X> {
-        if self.points.is_empty() {
-            return None;
-        }
-        let mut sorted_points: Vec<_> = self.points.iter().collect();
-        sorted_points.sort_by(|a, b| a.x().partial_cmp(b.x()).unwrap());
-        let pos = match self.direction {
-            Direction::Ascending => {
-                sorted_points.binary_search_by(|p| p.y().partial_cmp(&at_y).unwrap())
+        let (left, right) = crate::inverse_bounds(&self.points, self.direction, at_y, |p| p.y);
+        match (left, right) {
+            (Some(a), Some(b)) if self.points[a].y == at_y => Some(
+                self.points[a].x / cast::<f64, X>(2.0) + self.points[b].x / cast::<f64, X>(2.0),
+            ),
+            (Some(a), Some(b)) => {
+                Some(interpolate_x_from_y(&self.points[a], &self.points[b], at_y))
             }
-            Direction::Descending => {
-                sorted_points.binary_search_by(|p| at_y.partial_cmp(p.y()).unwrap())
-            }
-        };
-        match pos {
-            Ok(exact_idx) => {
-                let y_value = sorted_points[exact_idx].y();
-                let mut start_idx = exact_idx;
-                while start_idx > 0 && sorted_points[start_idx - 1].y() == y_value {
-                    start_idx -= 1;
-                }
-                let mut end_idx = exact_idx;
-                while end_idx < sorted_points.len() - 1 && sorted_points[end_idx + 1].y() == y_value
-                {
-                    end_idx += 1;
-                }
-                if start_idx < end_idx {
-                    let start_x = *sorted_points[start_idx].x();
-                    let end_x = *sorted_points[end_idx].x();
-                    Some((start_x + end_x) / cast::<f64, X>(2.0))
-                } else {
-                    Some(*sorted_points[exact_idx].x())
-                }
-            }
-            Err(0) => Some(sorted_points[0].x),
-            Err(n) if n == sorted_points.len() => Some(sorted_points[n - 1].x),
-            Err(n) => Some(interpolate_x_from_y(
-                sorted_points[n - 1],
-                sorted_points[n],
-                at_y,
-            )),
+            (Some(i), None) | (None, Some(i)) => Some(self.points[i].x),
+            (None, None) => None,
         }
     }
 }

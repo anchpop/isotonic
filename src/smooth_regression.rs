@@ -12,6 +12,7 @@ use num_traits::Float;
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SmoothRegression<X: Float, Y: Float = X> {
+    direction: Direction,
     /// Segment boundaries in Eytzinger order
     boundaries: Vec<X>,
     /// Quadratic coefficients (a, b, c) for each segment where y = at² + bt + c and t = x - boundary
@@ -54,7 +55,7 @@ impl<X: Float, Y: Float> SmoothRegression<X, Y> {
         window_half_width: X,
     ) -> SmoothRegression<X, Y> {
         let iso_points = isotonic(points, direction);
-        Self::build(iso_points, window_half_width)
+        Self::build(iso_points, direction, window_half_width)
     }
 
     /// Create a smoothed regression directly from pre-sorted points.
@@ -85,7 +86,7 @@ impl<X: Float, Y: Float> SmoothRegression<X, Y> {
         window_half_width: X,
     ) -> SmoothRegression<X, Y> {
         let iso_points = isotonic_presorted(points.to_vec(), direction);
-        Self::build(iso_points, window_half_width)
+        Self::build(iso_points, direction, window_half_width)
     }
 
     /// Create a smoothed regression from an isotonic regression (by value).
@@ -114,8 +115,9 @@ impl<X: Float, Y: Float> SmoothRegression<X, Y> {
         regression: IsotonicRegression<X, Y, W>,
         window_half_width: X,
     ) -> SmoothRegression<X, Y> {
+        let direction = regression.direction();
         let points = regression.into_points();
-        Self::build(points, window_half_width)
+        Self::build(points, direction, window_half_width)
     }
 
     /// Core builder: takes sorted isotonic points (any weight type) and builds
@@ -128,10 +130,12 @@ impl<X: Float, Y: Float> SmoothRegression<X, Y> {
     /// allocations.
     fn build<W: Weight>(
         points: Vec<Point<X, Y, W>>,
+        direction: Direction,
         window_half_width: X,
     ) -> SmoothRegression<X, Y> {
         if points.is_empty() {
             return SmoothRegression {
+                direction,
                 boundaries: Vec::new(),
                 coeffs: Vec::new(),
                 boundary_ys: Vec::new(),
@@ -299,6 +303,7 @@ impl<X: Float, Y: Float> SmoothRegression<X, Y> {
         }
 
         SmoothRegression {
+            direction,
             boundaries,
             coeffs,
             boundary_ys,
@@ -347,6 +352,7 @@ impl<X: Float, Y: Float> SmoothRegression<X, Y> {
     }
 
     /// Invert the smoothed function: given y, find x.
+    /// Plateaus invert to their midpoint; values outside the range clamp to an endpoint.
     ///
     /// # Examples
     ///
@@ -363,85 +369,52 @@ impl<X: Float, Y: Float> SmoothRegression<X, Y> {
     /// let x = smooth.invert(1.5);
     /// ```
     pub fn invert(&self, y: Y) -> Option<X> {
-        if self.coeffs.is_empty() {
-            return None;
-        }
-
-        // boundary_ys is in eytzinger order (same permutation as boundaries).
-        // For ascending regressions, boundary_ys in sorted order is ascending.
-        // For descending, it's descending. The eytzinger search expects the
-        // underlying sorted order to be ascending, so we flip the comparison
-        // for descending regressions.
-        let ascending = if self.boundary_ys.len() >= 2 {
-            // Check first and last in sorted order by looking at x_min/x_max boundaries
-            let y_at_min = self.interpolate(self.x_min).unwrap_or(Y::zero());
-            let y_at_max = self.interpolate(self.x_max).unwrap_or(Y::zero());
-            y_at_max >= y_at_min
-        } else {
-            true
+        let (left, right) = crate::inverse_bounds(&self.boundary_ys, self.direction, y, |&by| by);
+        let (i, next) = match (left, right) {
+            (Some(a), Some(b)) if self.boundary_ys[a] == y => {
+                return Some(
+                    self.boundaries[a] / cast::<f64, X>(2.0)
+                        + self.boundaries[b] / cast::<f64, X>(2.0),
+                );
+            }
+            (Some(a), Some(b)) => (a, b),
+            (Some(i), None) | (None, Some(i)) => return Some(self.boundaries[i]),
+            (None, None) => return None,
         };
-
-        let (lte, _gt) = if ascending {
-            self.boundary_ys
-                .eytzinger_interpolative_search_by(|&by| by.partial_cmp(&y).unwrap())
-        } else {
-            // For descending, reverse: find highest by >= y (i.e., search with flipped comparison)
-            self.boundary_ys
-                .eytzinger_interpolative_search_by(|&by| y.partial_cmp(&by).unwrap())
-        };
-
-        let i = match lte {
-            Some(idx) => idx.min(self.coeffs.len() - 1),
-            None => 0,
-        };
-
         let (a, b, c) = self.coeffs[i];
         let x0 = self.boundaries[i];
+        let x1 = self.boundaries[next];
+        let h: Y = cast(x1 - x0);
 
-        // Coefficients are in shifted form: y = a*t² + b*t + c, where t = x - x0
-        let epsilon = cast::<f64, Y>(1e-12);
-        if a.abs() < epsilon {
-            // Linear segment: y = b*t + c → t = (y - c) / b
-            Some(x0 + cast::<Y, X>((y - c) / b))
+        // Solve for u = t / h with every term divided by the largest one, so
+        // the discriminant can neither underflow nor overflow at extreme scales.
+        let (qa, qb, qd) = (a * h * h, b * h, y - c);
+        let scale = qa.abs().max(qb.abs()).max(qd.abs());
+        let (qa, qb, qd) = (qa / scale, qb / scale, qd / scale);
+
+        // Distinct neighbouring boundary ys bracket y, so this segment cannot
+        // be flat. Compare the quadratic and linear contributions on its width,
+        // rather than discarding small but significant coefficients outright.
+        let u = if qa.abs() <= Y::epsilon() * qb.abs() {
+            qd / qb
         } else {
-            // Quadratic: a*t² + b*t + (c - y) = 0
-            let c_shifted = c - y;
-            let discriminant = b * b - cast::<f64, Y>(4.0) * a * c_shifted;
-
-            if discriminant < Y::zero() {
-                return Some(X::zero());
-            }
-
-            let sqrt_disc = discriminant.sqrt();
-            let two_a = cast::<f64, Y>(2.0) * a;
-
-            // Roots in shifted coordinates, then convert back
-            let t1 = (-b + sqrt_disc) / two_a;
-            let t2 = (-b - sqrt_disc) / two_a;
-            let root1 = x0 + cast::<Y, X>(t1);
-            let root2 = x0 + cast::<Y, X>(t2);
-
-            // Pick the root that's in bounds
-            // We don't have easy access to the "next boundary in sorted order" from
-            // eytzinger layout, so use domain bounds as fallback
-            let x_lo = x0;
-            let x_hi = self.x_max;
-
-            if root1 >= x_lo && root1 <= x_hi {
-                Some(root1)
-            } else if root2 >= x_lo && root2 <= x_hi {
-                Some(root2)
+            let root = (qb * qb + cast::<f64, Y>(4.0) * qa * qd)
+                .max(Y::zero())
+                .sqrt();
+            let signed_root = match self.direction {
+                Direction::Ascending => root,
+                Direction::Descending => -root,
+            };
+            // Choose the root whose derivative has the fitted direction, using
+            // the rationalized formula to avoid cancellation near u = 0.
+            let denominator = qb + signed_root;
+            if denominator == Y::zero() {
+                -qb / (cast::<f64, Y>(2.0) * qa)
             } else {
-                let center = (x_lo + x_hi) / cast::<f64, X>(2.0);
-                let dist1 = (root1 - center).abs();
-                let dist2 = (root2 - center).abs();
-                if dist1 < dist2 {
-                    Some(root1)
-                } else {
-                    Some(root2)
-                }
+                cast::<f64, Y>(2.0) * qd / denominator
             }
-        }
+        };
+        Some((x0 + cast::<Y, X>(u * h)).max(x0).min(x1))
     }
 }
 
@@ -537,6 +510,29 @@ impl<X: Float, Y: Float> CumulativeIntegral<X, Y> {
 mod tests {
     use super::*;
     use crate::point::Point;
+
+    #[test]
+    fn test_invert_rounded_negative_discriminant() {
+        // A concave segment ending at its vertex. Boundary integration can
+        // round its final y a few ULPs above the polynomial's maximum.
+        for direction in [Direction::Ascending, Direction::Descending] {
+            let sign = if direction == Direction::Ascending {
+                1.0
+            } else {
+                -1.0
+            };
+            let smooth = SmoothRegression {
+                direction,
+                boundaries: vec![11.0, 10.0], // Eytzinger order
+                coeffs: vec![(0.0, 0.0, sign), (-sign, 2.0 * sign, 0.0)],
+                boundary_ys: vec![sign * (1.0 + 4.0 * f64::EPSILON), 0.0],
+                x_min: 10.0,
+                x_max: 11.0,
+            };
+            let y = sign * (1.0 + 2.0 * f64::EPSILON);
+            assert_eq!(smooth.invert(y), Some(11.0));
+        }
+    }
 
     #[test]
     fn test_smooth_regression_basic() {
